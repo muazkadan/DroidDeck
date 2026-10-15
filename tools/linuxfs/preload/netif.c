@@ -406,6 +406,7 @@ int bl_kgsl_poll(int (*real)(int, unsigned long, void *), int fd, unsigned long 
                  void *arg, int *rc) __attribute__((visibility("hidden")));
 int bl_ntsync_ioctl(int fd, unsigned long request, void *arg, int *rc) __attribute__((visibility("hidden")));
 int bl_drm_gem_close(int fd, unsigned long request, void *arg, int *rc) __attribute__((visibility("hidden")));
+int bl_remoteplay_ioctl(int fd, unsigned long request, void *arg, int *rc) __attribute__((visibility("hidden")));
 
 int ioctl(int fd, unsigned long request, ...) {
     typedef int (*ioctl_fn)(int, unsigned long, void *);
@@ -417,6 +418,7 @@ int ioctl(int fd, unsigned long request, ...) {
 
     int rc;
     if (bl_ntsync_ioctl(fd, request, arg, &rc)) return rc;
+    if (bl_remoteplay_ioctl(fd, request, arg, &rc)) return rc;
     if (bl_drm_gem_close(fd, request, arg, &rc)) return rc;
     if (real == NULL) real = (ioctl_fn) dlsym(RTLD_NEXT, "ioctl");
     if (!bl_kgsl_poll(real, fd, request, arg, &rc)) rc = quest_kgsl_ioctl(real, fd, request, arg);

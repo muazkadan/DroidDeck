@@ -90,6 +90,15 @@ class SessionTmpTest(unittest.TestCase):
         self.sweep()
         self.assertEqual("", self.sweep())
 
+    def test_breakpad_gets_a_world_writable_dumps_folder_despite_the_android_umask(self):
+        match = re.search(r"^prepare_dumps\(\) \{\n.*?^\}\n", SESSION.read_text(), re.M | re.S)
+        dumps = self.tmp / "dumps"
+        for _ in range(2):
+            subprocess.run(["bash", "-c", "umask 077; " + match.group(0).replace("/tmp/dumps", str(dumps))
+                            + "prepare_dumps"], check=True, timeout=30)
+            self.assertEqual(0o1777, dumps.stat().st_mode & 0o7777)
+            dumps.chmod(0o1700)
+
 
 if __name__ == "__main__":
     unittest.main()

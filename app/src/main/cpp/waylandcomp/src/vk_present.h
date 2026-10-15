@@ -65,6 +65,11 @@ struct vkp_perf {
     unsigned gpu_release_waits;
 };
 void vkp_perf_take(struct vkp_perf *out);
+/* Plain frames are submitted without waiting; a frame's serial is what vkp_image_last_use reports. */
+void vkp_drain(void);
+int vkp_frame_done(uint64_t serial);
+void vkp_wait_frame(uint64_t serial);
+uint64_t vkp_image_last_use(const struct vkp_image *img);
 int vkp_can_wait_sync_fd(void);
 
 struct droiddeck_color;

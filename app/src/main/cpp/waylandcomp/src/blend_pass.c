@@ -198,7 +198,7 @@ static VkImageView make_view(VkImage img, VkFormat fmt) {
         (out) = -1; \
         for (int k_ = 0; k_ < (n); k_++) { \
             if (!(arr)[k_].img) { (out) = k_; break; } \
-            if ((arr)[k_].frame != g_frame && g_frame - (arr)[k_].frame > age_) { age_ = g_frame - (arr)[k_].frame; (out) = k_; } \
+            if (g_frame - (arr)[k_].frame > 1 && g_frame - (arr)[k_].frame > age_) { age_ = g_frame - (arr)[k_].frame; (out) = k_; } \
         } \
     } while (0)
 
@@ -231,7 +231,7 @@ static VkFramebuffer dst_ensure(VkImage img, VkFormat fmt, int w, int h, VkRende
     for (i = 0; i < NDST; i++) {
         if (g_dst[i].img != img) continue;
         if (g_dst[i].fmt == fmt && g_dst[i].w == w && g_dst[i].h == h) { g_dst[i].frame = g_frame; return g_dst[i].fb; }
-        if (g_dst[i].frame == g_frame) return VK_NULL_HANDLE;
+        if (g_frame - g_dst[i].frame <= 1) return VK_NULL_HANDLE;
         break;
     }
     if (i == NDST) OLDEST(g_dst, NDST, i);

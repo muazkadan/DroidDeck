@@ -34,6 +34,7 @@ struct vkp_image {
     int in_general;
     VkFormat fmt;
     int sampled;
+    uint64_t last_use;
 };
 
 static ANativeWindow *g_window;
@@ -49,6 +50,8 @@ static VkCommandPool g_pool;
 static VkCommandBuffer g_cmds[MAX_PRESENTS];
 static VkSemaphore g_acqs[MAX_PRESENTS], g_rnds[MAX_PRESENTS];
 static VkFence g_fence;
+static int g_inflight;
+static uint64_t g_serial_submitted, g_serial_done;
 static int g_swap_extra;
 #define SCENE_FMT VK_FORMAT_R8G8B8A8_UNORM
 static VkPhysicalDeviceMemoryProperties g_memprops;
@@ -182,6 +185,7 @@ static void reset_sync(void) {
 static void destroy_swapchain(void) {
     g_base_black = 0;
     if (g_dev_state != 1) return;
+    vkp_drain();
     g_vk.DeviceWaitIdle(g_dev);
     reset_sync();
     for (uint32_t i = 0; i < g_nimg; i++) blendp_forget_image(g_images[i]);
@@ -994,6 +998,7 @@ struct vkp_image *vkp_image_create_shm(int w, int h) {
 
 void vkp_image_upload_shm(struct vkp_image *img, const void *data, int stride) {
     if (!img || !img->map || !data) return;
+    vkp_wait_frame(img->last_use);
     size_t rowbytes = (size_t)img->w * 4;
     if ((size_t)stride < rowbytes) rowbytes = (size_t)stride;
     for (int y = 0; y < img->h; y++)
@@ -1007,6 +1012,7 @@ int vkp_image_height(const struct vkp_image *img) { return img ? img->h : 0; }
 void vkp_image_destroy(struct vkp_image *img) {
     if (!img) return;
     if (g_dev) {
+        vkp_wait_frame(img->last_use);
         blendp_forget_image(img->image);
         if (img->map) g_vk.UnmapMemory(g_dev, img->mem);
         if (img->image) g_vk.DestroyImage(g_dev, img->image, NULL);
@@ -1189,6 +1195,8 @@ static int compose_hdr(VkCommandBuffer cmd, const struct vkp_draw *draws, int n,
 static void device_lost(const char *where) {
     if (g_dev_state == -2) return;
     g_dev_state = -2;
+    g_inflight = 0;
+    g_serial_done = g_serial_submitted;
     g_base_black = 0;
     vkp_framegen_device_lost();
     droiddeck_log("error", "GPU device lost (VK_ERROR_DEVICE_LOST in %s): the compositor has stopped presenting; "
@@ -1202,6 +1210,27 @@ static void device_lost(const char *where) {
     g_images = NULL;
     g_nimg = 0;
 }
+
+void vkp_drain(void) {
+    if (!g_inflight) return;
+    g_inflight = 0;
+    if (timed_wait(g_fence, UINT64_MAX) == VK_ERROR_DEVICE_LOST) device_lost("present");
+    g_serial_done = g_serial_submitted;
+}
+
+int vkp_frame_done(uint64_t serial) {
+    if (serial <= g_serial_done) return 1;
+    if (g_inflight && g_vk.GetFenceStatus(g_dev, g_fence) == VK_NOT_READY) return 0;
+    g_inflight = 0;
+    g_serial_done = g_serial_submitted;
+    return serial <= g_serial_done;
+}
+
+void vkp_wait_frame(uint64_t serial) {
+    if (!vkp_frame_done(serial)) vkp_drain();
+}
+
+uint64_t vkp_image_last_use(const struct vkp_image *img) { return img ? img->last_use : 0; }
 
 static const char *vk_result_name(VkResult r) {
     switch (r) {
@@ -1416,6 +1445,10 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
     check_surface_changed();
     if (g_dev_state == -2) return -1;
     if (dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0) return -1;
+    vkp_drain();
+    const uint64_t serial = ++g_serial_submitted;
+    for (int i = 0; i < n; i++)
+        if (draws[i].img) draws[i].img->last_use = serial;
 
     if (g_swapchain && vkp_framegen_extra_images() != g_swap_extra) {
         droiddeck_log("gpu", "frame generation now wants %d present%s per frame: rebuilding the swapchain",
@@ -1643,7 +1676,14 @@ static int render_impl(int scene_w, int scene_h, const struct vkp_draw *draws, i
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
         g_vk.QueueSubmit(g_queue, 1, &si, g_fence);
     }
-    VkResult fr = timed_wait(g_fence, UINT64_MAX);
+    /* Effects, frame generation, cardboard and HDR keep state across frames: they still wait here. */
+    VkResult fr = VK_SUCCESS;
+    if (!fx && !fg && !cb && !hf) {
+        g_inflight = 1;
+    } else {
+        fr = timed_wait(g_fence, UINT64_MAX);
+        g_serial_done = g_serial_submitted;
+    }
     if (fg) vkp_framegen_presented(presented_gen);
     if (fr == VK_ERROR_DEVICE_LOST || pr == VK_ERROR_DEVICE_LOST) { device_lost("present"); return -1; }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_ERROR_SURFACE_LOST_KHR) {
@@ -1730,6 +1770,7 @@ int vkp_blit_image(struct vkp_image *src, struct vkp_image *dst, int wait_fd) {
         if (wait_fd >= 0) close(wait_fd);
         return -1;
     }
+    vkp_drain();
     const int gpu_wait = take_wait_fd(wait_fd);
     if (gpu_wait < 0) return -1;
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -1802,6 +1843,7 @@ int vkp_image_readback(struct vkp_image *src, uint32_t *out, int max_px) {
     if (!src || !out || src->w <= 0 || src->h <= 0 || src->w * src->h > max_px ||
         g_dev_state == -2 || dev_init() != 0)
         return -1;
+    vkp_drain();
     if (g_rb && (g_rb->w != src->w || g_rb->h != src->h)) { vkp_image_destroy(g_rb); g_rb = NULL; }
     if (!g_rb) {
         struct vkp_image *img = calloc(1, sizeof(*img));
@@ -1912,6 +1954,7 @@ static int pass_begin_impl(int scene_w, int scene_h, const struct vkp_draw *draw
                            const struct vkp_hdr_frame *hf, int *rw, int *rh) {
     if (g_pass.active) vkp_pass_abort();
     if (g_dev_state == -2 || dev_init() != 0 || !g_window || scene_w <= 0 || scene_h <= 0) return -1;
+    vkp_drain();
     check_surface_changed();
     if (!g_swapchain && swap_init() != 0) return -1;
     update_map(scene_w, scene_h);

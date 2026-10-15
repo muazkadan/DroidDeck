@@ -280,6 +280,7 @@ struct pending_release {
     struct surface *surface;
     int64_t at_ns;
     int64_t since_ns;
+    uint64_t gpu_serial;
     struct wl_list link;
 };
 static struct wl_list g_pending_releases;
@@ -337,9 +338,13 @@ static void on_pending_release_buffer_destroyed(struct wl_listener *l, void *dat
 static void arm_release_timer(void) {
     struct pending_release *pr;
     int64_t earliest = 0;
+    const int64_t now = now_ns();
     if (g_release_timer_fd < 0) return;
-    wl_list_for_each(pr, &g_pending_releases, link)
-        if (!earliest || pr->at_ns < earliest) earliest = pr->at_ns;
+    wl_list_for_each(pr, &g_pending_releases, link) {
+        int64_t at = pr->at_ns;
+        if (at <= now && !vkp_frame_done(pr->gpu_serial)) at = now + 1000000;
+        if (!earliest || at < earliest) earliest = at;
+    }
     struct itimerspec its = {0};
     if (earliest) { its.it_value.tv_sec = earliest / 1000000000LL; its.it_value.tv_nsec = earliest % 1000000000LL; }
     timerfd_settime(g_release_timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
@@ -351,7 +356,7 @@ static int on_release_timer(int fd, uint32_t mask, void *data) {
     int64_t now = now_ns() + 300000;
     if (read(fd, &expirations, sizeof(expirations)) < 0 && errno != EAGAIN) return 0;
     wl_list_for_each_safe(pr, tmp, &g_pending_releases, link) {
-        if (pr->at_ns <= now) {
+        if (pr->at_ns <= now && vkp_frame_done(pr->gpu_serial)) {
             wl_buffer_send_release(pr->buffer);
             perf_note_release(pr->since_ns);
             pending_release_free(pr);
@@ -362,10 +367,16 @@ static int on_release_timer(int fd, uint32_t mask, void *data) {
     return 0;
 }
 
-static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_t since_ns) {
+static void release_now(struct wl_resource *buffer, int64_t since_ns, uint64_t gpu_serial) {
+    vkp_wait_frame(gpu_serial);
+    wl_buffer_send_release(buffer);
+    perf_note_release(since_ns);
+}
+
+static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_t since_ns, uint64_t gpu_serial) {
     const int limit = g_fps_limit;
     const int64_t interval = limit > 0 ? 1000000000LL / limit : g_refresh_ns;
-    if (interval <= 0 || g_release_timer_fd < 0) { wl_buffer_send_release(buffer); perf_note_release(since_ns); return; }
+    if (interval <= 0 || g_release_timer_fd < 0) { release_now(buffer, since_ns, gpu_serial); return; }
     int64_t now = now_ns();
     int64_t at = s->next_release_ns + interval;
     int64_t latest = now + interval * (int64_t)(s->releases_pending + 1);
@@ -373,8 +384,9 @@ static void release_buffer(struct surface *s, struct wl_resource *buffer, int64_
     if (at > latest) at = latest;
     s->next_release_ns = at;
     struct pending_release *pr = calloc(1, sizeof(*pr));
-    if (!pr) { wl_buffer_send_release(buffer); perf_note_release(since_ns); return; }
+    if (!pr) { release_now(buffer, since_ns, gpu_serial); return; }
     pr->buffer = buffer;
+    pr->gpu_serial = gpu_serial;
     pr->surface = s;
     pr->at_ns = at;
     pr->since_ns = since_ns;
@@ -582,8 +594,9 @@ static void drop_dmabuf(struct surface *s, int paced) {
     if (s->dmabuf) {
         wl_list_remove(&s->dmabuf_destroy.link);
         if (!ahb_swapchain_defer_release(s->dmabuf_buf, s->dmabuf, s, paced)) {
-            if (paced) release_buffer(s, s->dmabuf, now_ns());
-            else wl_buffer_send_release(s->dmabuf);
+            const uint64_t serial = s->dmabuf_buf ? vkp_image_last_use(s->dmabuf_buf->img) : 0;
+            if (paced) release_buffer(s, s->dmabuf, now_ns(), serial);
+            else { vkp_wait_frame(serial); wl_buffer_send_release(s->dmabuf); }
         }
         s->dmabuf = NULL;
     }
@@ -751,7 +764,7 @@ void **droiddeck_dmabuf_ahb_slot(struct dmabuf_buffer *b) { return &b->ahb_state
 void droiddeck_dmabuf_ref(struct dmabuf_buffer *b) { b->refs++; }
 void droiddeck_dmabuf_unref(struct dmabuf_buffer *b) { dmabuf_buffer_unref(b); }
 void droiddeck_release_buffer(struct surface *s, struct wl_resource *buffer, int paced, int64_t since_ns) {
-    if (paced && s) release_buffer(s, buffer, since_ns);
+    if (paced && s) release_buffer(s, buffer, since_ns, 0);
     else { wl_buffer_send_release(buffer); perf_note_release(since_ns); }
 }
 void droiddeck_surface_describe(const struct surface *s, char *out, size_t size) { describe(s, out, size); }
